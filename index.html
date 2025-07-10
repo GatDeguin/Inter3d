@@ -2,25 +2,22 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8">
-  <title>Tracker Completo: Manos, Cabeza y Ojos</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Tracker + Físicas 3‑D</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+
   <style>
-    html, body {
-      margin: 0; padding: 0; overflow: hidden;
-      width: 100%; height: 100%; background: #000;
-    }
-    /* Ocultamos el vídeo, dibujamos todo en el canvas */
-    video#input_video {
-      position: absolute; top: 0; left: 0;
-      width: 100%; height: 100%;
-      object-fit: cover; opacity: 0;
-    }
-    canvas#output_canvas {
-      position: absolute; top: 0; left: 0;
-      width: 100%; height: 100%;
-    }
+    html,body{margin:0;padding:0;overflow:hidden;width:100%;height:100%;background:#000;}
+    /* Vídeo oculto: solo lo usamos como entrada */
+    video#input_video{position:absolute;top:0;left:0;width:100%;height:100%;
+                      object-fit:cover;opacity:0;z-index:-1;}
+    /* Canvas WebGL (fondo) */
+    canvas#webgl_canvas{position:absolute;top:0;left:0;width:100%;height:100%;z-index:0;}
+    /* Canvas 2‑D overlay (landmarks) */
+    canvas#output_canvas{position:absolute;top:0;left:0;width:100%;height:100%;
+                         z-index:1;pointer-events:none;}
   </style>
-  <!-- MediaPipe Hands, FaceMesh y Drawing Utils -->
+
+  <!-- MediaPipe: manos, cara y utilidades -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
@@ -29,156 +26,210 @@
   <video id="input_video" playsinline muted autoplay></video>
   <canvas id="output_canvas"></canvas>
 
-  <script>
-    const video = document.getElementById('input_video');
-    const canvas = document.getElementById('output_canvas');
-    // Para acelerar getImageData en algunos navegadores:
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  <!-- Bloque principal en ES‑Modules -->
+  <script type="module">
+    /* ---------- Imports de librerías ---------- */
+    import * as THREE  from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js';
+    import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js';
 
-    // Colores por dedo (¡tal cual tu código original!)
-    const fingerColors = {
-      thumb:  '#FF0000',
-      index:  '#00FF00',
-      middle: '#0000FF',
-      ring:   '#FFFF00',
-      pinky:  '#FF00FF'
+    /* ---------- ELEMENTOS DOM ---------- */
+    const video  = document.getElementById('input_video');
+    const canvas = document.getElementById('output_canvas');
+    const ctx    = canvas.getContext('2d',{willReadFrequently:true});
+
+    /* ---------- ESCENA THREE + CANNON ---------- */
+    const scene  = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,100);
+    camera.position.set(0,1.5,3);
+
+    const renderer = new THREE.WebGLRenderer({antialias:true,alpha:true});
+    renderer.setSize(innerWidth,innerHeight);
+    renderer.domElement.id = 'webgl_canvas';
+    document.body.insertBefore(renderer.domElement,canvas);   // detrás del overlay
+
+    /* Luz */
+    scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.2));
+
+    /* Mundo físico */
+    const world = new CANNON.World({gravity:new CANNON.Vec3(0,-9.82,0)});
+
+    /* Suelo infinito (plano) */
+    const ground = new CANNON.Body({mass:0,shape:new CANNON.Plane()});
+    ground.quaternion.setFromEuler(-Math.PI/2,0,0);
+    world.addBody(ground);
+
+    /* Cubo 'juguete' que vamos a manipular */
+    const baseSize = 0.3;                         // medio‐lado físico inicial
+    const boxBody  = new CANNON.Body({
+      mass:1,
+      shape:new CANNON.Box(new CANNON.Vec3(baseSize,baseSize,baseSize))
+    });
+    boxBody.position.set(0,1,0);
+    world.addBody(boxBody);
+
+    const boxGeo  = new THREE.BoxGeometry(baseSize*2,baseSize*2,baseSize*2);
+    const boxMat  = new THREE.MeshStandardMaterial({color:0x2194ce});
+    const boxMesh = new THREE.Mesh(boxGeo,boxMat);
+    scene.add(boxMesh);
+
+    /* ---------- VARIABLES DE GESTOS ---------- */
+    let handLandmarks = [], faceResults=null;
+    const fingerColors = {thumb:'#FF0000',index:'#00FF00',middle:'#0000FF',
+                          ring:'#FFFF00',pinky:'#FF00FF'};
+
+    const raycaster = new THREE.Raycaster();
+    let grabbed=false, handProxy=null, grabJoint=null, scaleInit=null;
+
+    const isPinching = hand => {
+      if(!hand) return false;
+      const t=hand[4], i=hand[8];
+      const dx=t.x-i.x, dy=t.y-i.y, dz=t.z-i.z;
+      return Math.sqrt(dx*dx+dy*dy+dz*dz) < 0.04;   // umbral empírico
     };
 
-    let handLandmarks = [], faceResults = null;
+    /* ---------- CÁMARA WEB ---------- */
+    navigator.mediaDevices.getUserMedia({video:true})
+      .then(s=>{video.srcObject=s;})
+      .catch(err=>alert('No se pudo acceder a la cámara: '+err));
 
-    // 1) Inicializar cámara
-    navigator.mediaDevices.getUserMedia({ video: true })
-      .then(stream => { video.srcObject = stream; })
-      .catch(err => alert('No se pudo acceder a la cámara: ' + err));
-
-    // 2) Configurar MediaPipe Hands
-    const hands = new Hands({
-      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
-    });
+    /* ---------- MEDIAPIPE HANDS ---------- */
+    const hands = new Hands({locateFile:f=>
+      `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
     hands.setOptions({
-      maxNumHands: 2,
-      modelComplexity: 1,
-      minDetectionConfidence: 0.7,
-      minTrackingConfidence: 0.7
+      maxNumHands:2, modelComplexity:1,
+      minDetectionConfidence:0.7, minTrackingConfidence:0.7
     });
-    hands.onResults(results => {
-      handLandmarks = results.multiHandLandmarks || [];
-    });
+    hands.onResults(r=>{handLandmarks=r.multiHandLandmarks||[];});
 
-    // 3) Configurar MediaPipe FaceMesh
-    const faceMesh = new FaceMesh({
-      locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`
-    });
+    /* ---------- MEDIAPIPE FACEMESH ---------- */
+    const faceMesh = new FaceMesh({locateFile:f=>
+      `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
     faceMesh.setOptions({
-      maxNumFaces: 1,
-      refineLandmarks: true,
-      minDetectionConfidence: 0.7,
-      minTrackingConfidence: 0.7
+      maxNumFaces:1, refineLandmarks:true,
+      minDetectionConfidence:0.7, minTrackingConfidence:0.7
     });
-    faceMesh.onResults(results => {
-      faceResults = results;
-    });
+    faceMesh.onResults(r=>{faceResults=r;});
 
-    // 4) Bucle de dibujo
-    async function onFrame() {
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-        // 4.1 Procesar ambas redes
-        await hands.send({ image: video });
-        await faceMesh.send({ image: video });
+    /* ---------- BUCLE MEDIAPIPE + GESTOS ---------- */
+    async function onFrame(){
+      if(video.readyState>=HTMLMediaElement.HAVE_CURRENT_DATA){
+        await Promise.all([hands.send({image:video}),
+                           faceMesh.send({image:video})]);
 
-        // 4.2 Preparamos canvas
-        const vw = video.videoWidth, vh = video.videoHeight;
-        const cw = canvas.width  = window.innerWidth;
-        const ch = canvas.height = window.innerHeight;
-        const scale = Math.min(cw/vw, ch/vh);
-        const dw = vw * scale, dh = vh * scale;
-        const dx = (cw - dw) / 2, dy = (ch - dh) / 2;
+        /* ---- Canvas overlay ---- */
+        const vw=video.videoWidth, vh=video.videoHeight;
+        const cw=canvas.width = innerWidth;
+        const ch=canvas.height= innerHeight;
+        const scale=Math.min(cw/vw,ch/vh);
+        const dw=vw*scale, dh=vh*scale;
+        const dx=(cw-dw)/2, dy=(ch-dh)/2;
 
-        ctx.save();
-        // espejo horizontal
-        ctx.translate(cw, 0);
-        ctx.scale(-1, 1);
-        // pinta el vídeo
-        ctx.drawImage(video, 0, 0, vw, vh, dx, dy, dw, dh);
+        ctx.save(); ctx.translate(cw,0); ctx.scale(-1,1);         // espejo
+        ctx.drawImage(video,0,0,vw,vh,dx,dy,dw,dh);
 
-        // 4.3 --- DIBUJAR MANOS (tu código original) ---
-        handLandmarks.forEach(landmarks => {
-          // Conectores verdes
-          ctx.strokeStyle = '#00FF00';
-          ctx.lineWidth = 2;
-          HAND_CONNECTIONS.forEach(([i, j]) => {
-            const p1 = landmarks[i], p2 = landmarks[j];
+        /* ---- Manos ---- */
+        handLandmarks.forEach(lm=>{
+          // conexiones
+          ctx.strokeStyle='#00FF00'; ctx.lineWidth=2;
+          HAND_CONNECTIONS.forEach(([i,j])=>{
+            const p1=lm[i], p2=lm[j];
             ctx.beginPath();
-            ctx.moveTo(dx + p1.x * dw, dy + p1.y * dh);
-            ctx.lineTo(dx + p2.x * dw, dy + p2.y * dh);
+            ctx.moveTo(dx+p1.x*dw,dy+p1.y*dh);
+            ctx.lineTo(dx+p2.x*dw,dy+p2.y*dh);
             ctx.stroke();
           });
-          // Puntos coloreados por dedo
-          landmarks.forEach((lm, i) => {
-            const x = dx + lm.x * dw, y = dy + lm.y * dh;
-            let color = '#FFFFFF';
-            if (i >= 1  && i <= 4)   color = fingerColors.thumb;
-            if (i >= 5  && i <= 8)   color = fingerColors.index;
-            if (i >= 9  && i <= 12)  color = fingerColors.middle;
-            if (i >= 13 && i <= 16)  color = fingerColors.ring;
-            if (i >= 17 && i <= 20)  color = fingerColors.pinky;
-            ctx.beginPath();
-            ctx.arc(x, y, 6, 0, 2 * Math.PI);
-            ctx.fillStyle = color;
-            ctx.fill();
+          // puntos
+          lm.forEach((p,i)=>{
+            const x=dx+p.x*dw, y=dy+p.y*dh;
+            let col='#FFF';
+            if(i>=1 && i<=4)   col=fingerColors.thumb;
+            if(i>=5 && i<=8)   col=fingerColors.index;
+            if(i>=9 && i<=12)  col=fingerColors.middle;
+            if(i>=13&& i<=16)  col=fingerColors.ring;
+            if(i>=17&& i<=20)  col=fingerColors.pinky;
+            ctx.beginPath(); ctx.arc(x,y,6,0,2*Math.PI);
+            ctx.fillStyle=col; ctx.fill();
           });
         });
 
-        // 4.4 --- DIBUJAR CABEZA Y OJOS (FaceMesh) ---
-        if (faceResults && faceResults.multiFaceLandmarks.length) {
+        /* ---- Cara + ojos ---- */
+        if(faceResults && faceResults.multiFaceLandmarks.length){
           const lm = faceResults.multiFaceLandmarks[0];
-          // Calcular bbox de la cara
-          let minX=1, minY=1, maxX=0, maxY=0;
-          lm.forEach(p => {
-            minX = Math.min(minX, p.x);
-            minY = Math.min(minY, p.y);
-            maxX = Math.max(maxX, p.x);
-            maxY = Math.max(maxY, p.y);
-          });
-          ctx.strokeStyle = '#00FF00';
-          ctx.lineWidth = 2;
-          ctx.strokeRect(
-            dx + minX * dw,
-            dy + minY * dh,
-            (maxX - minX) * dw,
-            (maxY - minY) * dh
-          );
-
-          // Bbox ojos (índices de FaceMesh)
-          const leftEyeIdx  = [33, 133, 159, 145];
-          const rightEyeIdx = [362, 263, 386, 374];
-          [leftEyeIdx, rightEyeIdx].forEach(indices => {
-            let exMin=1, eyMin=1, exMax=0, eyMax=0;
-            indices.forEach(i => {
-              const p = lm[i];
-              exMin = Math.min(exMin, p.x);
-              eyMin = Math.min(eyMin, p.y);
-              exMax = Math.max(exMax, p.x);
-              eyMax = Math.max(eyMax, p.y);
-            });
-            ctx.strokeStyle = '#FF0000';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(
-              dx + exMin * dw,
-              dy + eyMin * dh,
-              (exMax - exMin) * dw,
-              (eyMax - eyMin) * dh
-            );
-          });
+          let minX=1,minY=1,maxX=0,maxY=0;
+          lm.forEach(p=>{minX=Math.min(minX,p.x);minY=Math.min(minY,p.y);
+                         maxX=Math.max(maxX,p.x);maxY=Math.max(maxY,p.y);});
+          ctx.strokeStyle='#00FF00'; ctx.lineWidth=2;
+          ctx.strokeRect(dx+minX*dw,dy+minY*dh,(maxX-minX)*dw,(maxY-minY)*dh);
         }
-
         ctx.restore();
+
+        /* ---- GESTOS SOBRE EL CUBO ---- */
+        const [handA,handB] = handLandmarks;
+        /* --- Agarre / soltar --- */
+        if(handA && isPinching(handA) && !grabbed){
+          const xN= 2*handA[8].x-1, yN=-2*handA[8].y+1;
+          raycaster.setFromCamera({x:xN,y:yN},camera);
+          const hit = raycaster.intersectObject(boxMesh)[0];
+          if(hit){
+            handProxy=new CANNON.Body({mass:0});
+            handProxy.position.copy(boxBody.position);
+            world.addBody(handProxy);
+            grabJoint=new CANNON.LockConstraint(boxBody,handProxy);
+            world.addConstraint(grabJoint);
+            grabbed=true;
+          }
+        }
+        /* --- Actualizar cuerpo "mano" --- */
+        if(grabbed && handProxy && handA){
+          const xN= 2*handA[8].x-1, yN=-2*handA[8].y+1;
+          const vec=new THREE.Vector3(xN,yN,0.5).unproject(camera);
+          handProxy.position.copy(vec);
+          // Soltar
+          if(!isPinching(handA)){
+            world.removeConstraint(grabJoint);
+            world.removeBody(handProxy);
+            handProxy=grabJoint=null;
+            grabbed=false;
+          }
+        }
+        /* --- Escala con dos manos --- */
+        if(handA && handB){
+          const d=Math.hypot(handA[0].x-handB[0].x,handA[0].y-handB[0].y);
+          if(isPinching(handA)&&isPinching(handB)){
+            if(scaleInit===null) scaleInit=d;
+            const factor=d/scaleInit;
+            boxMesh.scale.setScalar(factor);
+            const half=baseSize*factor;
+            boxBody.shapes[0].halfExtents.set(half,half,half);
+            boxBody.shapes[0].updateConvexPolyhedronRepresentation();
+            boxBody.updateBoundingRadius();
+          }else{scaleInit=null;}
+        }
       }
       requestAnimationFrame(onFrame);
     }
+    video.addEventListener('playing',onFrame);
 
-    // 5) Arrancar loop cuando el vídeo esté listo
-    video.addEventListener('playing', onFrame);
+    /* ---------- BUCLE DE FÍSICA + RENDER ---------- */
+    let lastT=performance.now();
+    function animate(){
+      requestAnimationFrame(animate);
+      const now=performance.now(), dt=(now-lastT)/1000; lastT=now;
+      world.step(1/60,dt,3);                 // ~60 Hz
+
+      /* Sincronizar malla con cuerpo */
+      boxMesh.position.copy(boxBody.position);
+      boxMesh.quaternion.copy(boxBody.quaternion);
+
+      renderer.render(scene,camera);
+    }
+    animate();
+
+    /* ---------- Responsivo ---------- */
+    addEventListener('resize',()=>{
+      camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth,innerHeight);
+    });
   </script>
 </body>
 </html>
