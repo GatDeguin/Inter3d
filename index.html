@@ -1,31 +1,33 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="UTF-8">
-  <title>AR Hands + Físicas 3‑D</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta charset="utf-8">
+  <title>AR Hands + Físicas 3‑D</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
   <style>
     html,body{margin:0;padding:0;overflow:hidden;width:100%;height:100%;background:#000;}
 
-    /* Cámara como fondo (espejada); ¡opacidad ≠ 0 para evitar el bug WebKit! */
+    /* 1 – Cámara como fondo (espejada).  opacidad ≠ 0 para iOS / WebKit */
     video#input_video{
       position:absolute;top:0;left:0;width:100%;height:100%;
-      object-fit:cover;transform:scaleX(-1);          /* modo espejo */
+      object-fit:cover;transform:scaleX(-1);
       z-index:0;opacity:1;pointer-events:none;
     }
-    /* Canvas WebGL (cubo) */
+
+    /* 2 – Canvas WebGL (cubo) */
     canvas#webgl_canvas{
       position:absolute;top:0;left:0;width:100%;height:100%;
       z-index:1;
     }
-    /* Canvas overlay 2‑D (landmarks) */
+
+    /* 3 – Canvas overlay 2‑D (landmarks) */
     canvas#overlay_canvas{
       position:absolute;top:0;left:0;width:100%;height:100%;
       z-index:2;pointer-events:none;
     }
   </style>
 
-  <!-- MediaPipe (scripts clásicos UMD) -->
+  <!-- MediaPipe (UMD) -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
@@ -35,113 +37,109 @@
   <canvas id="webgl_canvas"></canvas>
   <canvas id="overlay_canvas"></canvas>
 
-  <!-- ---------- LÓGICA PRINCIPAL (ES‑Modules) ---------- -->
+  <!-- ========= LÓGICA PRINCIPAL ========= -->
   <script type="module">
-    /********** IMPORTS ES (Three.js y Cannon‑ES) **********/
+    /********  Imports ES (Three.js & Cannon‑ES)  ********/
     import * as THREE  from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js';
     import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js';
 
-    /********** PUENTE GLOBALS → MÓDULO *******************/
+    /********  Bridge globals → módulo  ********/
     const Hands            = window.Hands;
     const FaceMesh         = window.FaceMesh;
     const HAND_CONNECTIONS = window.HAND_CONNECTIONS;
-    if(!Hands||!FaceMesh){ console.error('⚠️ MediaPipe no cargó'); }
 
-    /********** DOM ****************************************/
+    /********  DOM refs  ********/
     const video   = document.getElementById('input_video');
+    const webglC  = document.getElementById('webgl_canvas');
     const overlay = document.getElementById('overlay_canvas');
     const ctx     = overlay.getContext('2d',{willReadFrequently:true});
-    const webgl   = document.getElementById('webgl_canvas');
 
-    /********** THREE + CANNON *****************************/
+    /********  Three.js + Cannon‑ES  ********/
     const scene  = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,100);
     camera.position.set(0,1.5,3);
 
-    const renderer = new THREE.WebGLRenderer({canvas:webgl,antialias:true,alpha:true});
+    const renderer = new THREE.WebGLRenderer({canvas:webglC,antialias:true,alpha:true});
     renderer.setSize(innerWidth,innerHeight);
 
     scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.2));
 
     const world = new CANNON.World({gravity:new CANNON.Vec3(0,-9.82,0)});
+
+    /* Suelo infinito */
     const ground = new CANNON.Body({mass:0,shape:new CANNON.Plane()});
     ground.quaternion.setFromEuler(-Math.PI/2,0,0);
     world.addBody(ground);
 
-    /* Cubo físico */
-    const baseSize = 0.3;
-    const boxBody  = new CANNON.Body({
+    /* Cubo rígido */
+    const base = 0.3;
+    const boxBody = new CANNON.Body({
       mass:1,
-      shape:new CANNON.Box(new CANNON.Vec3(baseSize,baseSize,baseSize))
+      shape:new CANNON.Box(new CANNON.Vec3(base,base,base))
     });
     boxBody.position.set(0,1,0);
     world.addBody(boxBody);
 
     const boxMesh = new THREE.Mesh(
-      new THREE.BoxGeometry(baseSize*2,baseSize*2,baseSize*2),
+      new THREE.BoxGeometry(base*2,base*2,base*2),
       new THREE.MeshStandardMaterial({color:0x135d8c})
     );
     scene.add(boxMesh);
 
-    /********** LANDMARKS & GESTOS *************************/
+    /********  Variables de AR / gestos  ********/
     let handLandmarks=[], faceResults=null;
-    const fingerColors={thumb:'#F00',index:'#0F0',middle:'#00F',ring:'#FF0',pinky:'#F0F'};
     const raycaster = new THREE.Raycaster();
+    const fingerCol={thumb:'#F00',index:'#0F0',middle:'#00F',ring:'#FF0',pinky:'#F0F'};
 
     let grabbed=false, handProxy=null, grabJoint=null, scaleInit=null;
-    const isPinching = h=>{
-      if(!h) return false;
-      return Math.hypot(h[4].x-h[8].x,h[4].y-h[8].y,h[4].z-h[8].z) < 0.04;
-    };
+    const isPinching = h=>h &&
+      Math.hypot(h[4].x-h[8].x,h[4].y-h[8].y,h[4].z-h[8].z) < 0.04;
 
-    /********** MEDIAPIPE: Hands ***************************/
+    /********  MediaPipe – Hands  ********/
     const hands = new Hands({
       locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
     });
     hands.setOptions({
       maxNumHands:2, modelComplexity:1,
-      minDetectionConfidence:0.7, minTrackingConfidence:0.7
+      minDetectionConfidence:0.4, minTrackingConfidence:0.4    /* umbral bajo */
     });
-    hands.onResults(r=>{ handLandmarks=r.multiHandLandmarks||[]; });
+    hands.onResults(r=>{handLandmarks=r.multiHandLandmarks||[];});
 
-    /********** MEDIAPIPE: FaceMesh ************************/
+    /********  MediaPipe – FaceMesh  ********/
     const faceMesh = new FaceMesh({
       locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`
     });
     faceMesh.setOptions({
       maxNumFaces:1, refineLandmarks:true,
-      minDetectionConfidence:0.7, minTrackingConfidence:0.7
+      minDetectionConfidence:0.6, minTrackingConfidence:0.6
     });
-    faceMesh.onResults(r=>{ faceResults=r; });
+    faceMesh.onResults(r=>{faceResults=r;});
 
-    /********** CÁMARA *************************************/
+    /********  Cámara  ********/
     navigator.mediaDevices.getUserMedia({video:{facingMode:'user'}})
-      .then(stream=>{
-        video.srcObject = stream;
-        video.addEventListener('canplay',()=>{
-          video.play().catch(console.warn);
-          onFrame();           // arranca loop 2‑D
-        });
+      .then(s=>{
+        video.srcObject=s;
+        video.addEventListener('canplay',()=>{ video.play(); onFrame(); });
       })
       .catch(e=>alert('Permiso de cámara denegado:\n'+e));
 
-    /********** LOOP 2‑D (overlay landmarks) ***************/
+    /********  Loop 2‑D (landmarks)  ********/
     async function onFrame(){
       if(video.readyState>=2 && video.videoWidth){
         await Promise.all([hands.send({image:video}), faceMesh.send({image:video})]);
 
-        /* ------- Prepara canvas y flip horizontal ------- */
         const vw=video.videoWidth, vh=video.videoHeight;
         const cw=overlay.width=innerWidth, ch=overlay.height=innerHeight;
-        const s=Math.min(cw/vw, ch/vh), dw=vw*s, dh=vh*s, dx=(cw-dw)/2, dy=(ch-dh)/2;
+        const s=Math.min(cw/vw,ch/vh), dw=vw*s, dh=vh*s, dx=(cw-dw)/2, dy=(ch-dh)/2;
 
         ctx.clearRect(0,0,cw,ch);
-        ctx.save();
-        ctx.translate(cw,0); ctx.scale(-1,1);      // espejo para alinear con vídeo
 
-        /* ---- DIBUJAR MANOS ---- */
+        /* ===== Dibujar manos ===== */
+        ctx.save();
+        ctx.translate(cw,0); ctx.scale(-1,1);       // espejo
         handLandmarks.forEach(lm=>{
-          ctx.strokeStyle='#0F0'; ctx.lineWidth=2;
+          /* Conectores */
+          ctx.strokeStyle='#0F0'; ctx.lineWidth=4;
           HAND_CONNECTIONS.forEach(([i,j])=>{
             const p1=lm[i], p2=lm[j];
             ctx.beginPath();
@@ -149,31 +147,32 @@
             ctx.lineTo(dx+p2.x*dw, dy+p2.y*dh);
             ctx.stroke();
           });
+          /* Puntos */
           lm.forEach((p,i)=>{
             const x=dx+p.x*dw, y=dy+p.y*dh;
             let col='#FFF';
-            if(i<=4)col=fingerColors.thumb; else
-            if(i<=8)col=fingerColors.index; else
-            if(i<=12)col=fingerColors.middle; else
-            if(i<=16)col=fingerColors.ring; else col=fingerColors.pinky;
-            ctx.beginPath(); ctx.arc(x,y,5,0,2*Math.PI);
+            if(i<=4)col=fingerCol.thumb; else
+            if(i<=8)col=fingerCol.index; else
+            if(i<=12)col=fingerCol.middle; else
+            if(i<=16)col=fingerCol.ring; else col=fingerCol.pinky;
+            ctx.beginPath(); ctx.arc(x,y,10,0,2*Math.PI);
             ctx.fillStyle=col; ctx.fill();
           });
         });
 
-        /* ---- DIBUJAR CARA ---- */
+        /* ===== Dibujar cara ===== */
         if(faceResults?.multiFaceLandmarks?.length){
           const lm=faceResults.multiFaceLandmarks[0];
           let minX=1,minY=1,maxX=0,maxY=0;
           lm.forEach(p=>{minX=Math.min(minX,p.x);minY=Math.min(minY,p.y);
                          maxX=Math.max(maxX,p.x);maxY=Math.max(maxY,p.y);});
-          ctx.strokeStyle='#0F0'; ctx.lineWidth=2;
+          ctx.strokeStyle='#0F0'; ctx.lineWidth=3;
           ctx.strokeRect(dx+minX*dw,dy+minY*dh,(maxX-minX)*dw,(maxY-minY)*dh);
         }
         ctx.restore();
 
-        /* ---- GESTOS SOBRE CUBO ---- */
-        const [hA,hB] = handLandmarks;
+        /* ===== Gestos sobre el cubo ===== */
+        const [hA,hB]=handLandmarks;
         /* Agarre */
         if(hA && isPinching(hA) && !grabbed){
           const xN=2*hA[8].x-1, yN=-2*hA[8].y+1;
@@ -191,7 +190,7 @@
         if(grabbed && handProxy && hA){
           const xN=2*hA[8].x-1, yN=-2*hA[8].y+1;
           handProxy.position.copy(new THREE.Vector3(xN,yN,0.5).unproject(camera));
-          if(!isPinching(hA)){        // soltar
+          if(!isPinching(hA)){
             world.removeConstraint(grabJoint); world.removeBody(handProxy);
             grabJoint=handProxy=null; grabbed=false;
           }
@@ -203,17 +202,17 @@
             if(scaleInit===null) scaleInit=d;
             const f=d/scaleInit;
             boxMesh.scale.setScalar(f);
-            const half=baseSize*f;
+            const half=base*f;
             boxBody.shapes[0].halfExtents.set(half,half,half);
             boxBody.shapes[0].updateConvexPolyhedronRepresentation();
             boxBody.updateBoundingRadius();
-          }else{ scaleInit=null; }
+          }else scaleInit=null;
         }
       }
       requestAnimationFrame(onFrame);
     }
 
-    /********** LOOP 3‑D (física + render) ****************/
+    /********  Loop 3‑D (física + render)  ********/
     let last=performance.now();
     (function anim(){
       requestAnimationFrame(anim);
@@ -224,7 +223,7 @@
       renderer.render(scene,camera);
     })();
 
-    /********** RESPONSIVE ********************************/
+    /********  Responsive  ********/
     addEventListener('resize',()=>{
       camera.aspect=innerWidth/innerHeight;
       camera.updateProjectionMatrix();
