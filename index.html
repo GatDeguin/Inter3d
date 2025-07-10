@@ -2,12 +2,12 @@
 <html lang="es">
 <head>
 <meta charset="utf-8">
-<title>AR Hands + Físicas 3‑D (Versión Mejorada)</title>
+<title>AR Hands + Cubo 3‑D (con límites & selector de cámara)</title>
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <style>
   html,body{margin:0;padding:0;overflow:hidden;width:100%;height:100%;background:#000;}
 
-  /* Cámara en espejo (opacidad 1 para evitar bug WebKit) */
+  /* Flujo de cámara como fondo (espejado) */
   video#cam{
     position:absolute;top:0;left:0;width:100%;height:100%;
     object-fit:cover;transform:scaleX(-1);z-index:0;opacity:1;pointer-events:none;
@@ -16,9 +16,15 @@
   /* Canvas WebGL (cubo) */
   canvas#gl{position:absolute;top:0;left:0;width:100%;height:100%;z-index:1;}
 
-  /* Canvas overlay 2‑D (landmarks) */
-  canvas#ol{position:absolute;top:0;left:0;width:100%;height:100%;
-            z-index:2;pointer-events:none;}
+  /* Canvas overlay (landmarks) */
+  canvas#ol{position:absolute;top:0;left:0;width:100%;height:100%;z-index:2;pointer-events:none;}
+
+  /* Selector de cámaras */
+  #camSelect{
+    position:absolute;top:8px;right:8px;z-index:3;
+    background:#222;color:#fff;font:14px sans-serif;border:none;padding:4px 6px;
+    border-radius:4px;opacity:.8;
+  }
 </style>
 
 <!-- MediaPipe (UMD) -->
@@ -27,46 +33,66 @@
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
 </head>
 <body>
+<select id="camSelect"></select>
 <video id="cam" playsinline muted></video>
 <canvas id="gl"></canvas>
 <canvas id="ol"></canvas>
 
 <script type="module">
-/* ------------ Imports ES (Three.js & Cannon‑ES) ------------ */
+/* ---------- Imports ES (Three.js + Cannon‑ES) ---------- */
 import * as THREE  from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js';
 import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js';
 
-/* ------------ Bridge globals (MediaPipe) ------------------- */
+/* ---------- Bridge de MediaPipe (globals) --------------- */
 const Hands            = window.Hands;
 const FaceMesh         = window.FaceMesh;
 const HAND_CONNECTIONS = window.HAND_CONNECTIONS;
 
-/* ------------ DOM refs ------------------------------------- */
+/* ---------- DOM refs ------------------------------------ */
 const video  = document.getElementById('cam');
 const glC    = document.getElementById('gl');
 const olC    = document.getElementById('ol');
 const ctx    = olC.getContext('2d',{willReadFrequently:true});
+const camSel = document.getElementById('camSelect');
 
-/* ------------ THREE + CANNON set‑up ------------------------ */
+/* ---------- THREE + CANNON ------------------------------ */
 const scene  = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,100);
 camera.position.set(0,1.5,3);
 
 const renderer = new THREE.WebGLRenderer({canvas:glC,antialias:true,alpha:true});
 renderer.setSize(innerWidth,innerHeight);
-
 scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.2));
 
-const world  = new CANNON.World({gravity:new CANNON.Vec3(0,-9.82,0)});
-const ground = new CANNON.Body({mass:0,shape:new CANNON.Plane()});
-ground.quaternion.setFromEuler(-Math.PI/2,0,0);
-world.addBody(ground);
+const world = new CANNON.World({gravity:new CANNON.Vec3(0,-9.82,0)});
 
-/* Cubo rígido ------------------------------------------------ */
-const base   = 0.3;                           // medio‑lado inicial
+/* Material de rebote */
+const bounceMat = new CANNON.Material('bounce');
+world.defaultContactMaterial.restitution = 0.6;
+
+/* Suelo + paredes + techo -------------------------------- */
+function wall(size,posQuat){
+  const body = new CANNON.Body({mass:0,material:bounceMat});
+  body.addShape(new CANNON.Box(size));
+  body.position.copy(posQuat.pos);
+  body.quaternion.copy(posQuat.quat);
+  world.addBody(body);
+}
+const half = 0.05, box = 2;      // grosor pared 0.1, caja interna 4×4×4
+
+wall(new CANNON.Vec3(half,box,box),  {pos:new CANNON.Vec3(-1.5-half,1.5,0), quat:new CANNON.Quaternion()});          // izquierda
+wall(new CANNON.Vec3(half,box,box),  {pos:new CANNON.Vec3( 1.5+half,1.5,0), quat:new CANNON.Quaternion()});          // derecha
+wall(new CANNON.Vec3(box,half,box),  {pos:new CANNON.Vec3(0,3+half,0),      quat:new CANNON.Quaternion()});          // techo
+wall(new CANNON.Vec3(box,half,box),  {pos:new CANNON.Vec3(0,0-half,0),      quat:new CANNON.Quaternion()});          // suelo
+wall(new CANNON.Vec3(box,box,half),  {pos:new CANNON.Vec3(0,1.5,-1.5-half), quat:new CANNON.Quaternion()});          // frente (hacia cámara)
+wall(new CANNON.Vec3(box,box,half),  {pos:new CANNON.Vec3(0,1.5, 1.5+half), quat:new CANNON.Quaternion()});          // fondo
+
+/* Cubo rígido -------------------------------------------- */
+const base = 0.3;
 const boxBody = new CANNON.Body({
   mass:1,
-  shape:new CANNON.Box(new CANNON.Vec3(base,base,base))
+  shape:new CANNON.Box(new CANNON.Vec3(base,base,base)),
+  material:bounceMat
 });
 boxBody.position.set(0,1,0);
 world.addBody(boxBody);
@@ -77,37 +103,59 @@ const boxMesh = new THREE.Mesh(
 );
 scene.add(boxMesh);
 
-/* ------------ AR / gestos vars ----------------------------- */
+/* ---------- AR vars & helpers --------------------------- */
 let handLm=[], faceRes=null;
-const ray     = new THREE.Raycaster();
-const colors  = {thumb:'#F00',index:'#0F0',middle:'#00F',ring:'#FF0',pinky:'#F0F'};
-const isPinch = h=>h && Math.hypot(h[4].x-h[8].x,h[4].y-h[8].y,h[4].z-h[8].z) < 0.04;
+const ray      = new THREE.Raycaster();
+const colors   = {thumb:'#F00',index:'#0F0',middle:'#00F',ring:'#FF0',pinky:'#F0F'};
+const isPinch  = h=>h && Math.hypot(h[4].x-h[8].x,h[4].y-h[8].y,h[4].z-h[8].z)<0.04;
 
-/* proxy kinemático de la mano */
+/* Hand proxy */
 let handProxy=null, grabJoint=null, grabbed=false;
-let prevPos = new CANNON.Vec3();              // para velocidad
-let lastDt  = 1/60;                           // dt último step física
-let scaleInit=null;
+let prevPos=new CANNON.Vec3(), lastDt=1/60, scaleInit=null;
 
-/* ------------ MediaPipe Hands ------------------------------ */
+/* ---------- MediaPipe Hands ----------------------------- */
 const hands = new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
 hands.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:0.4,minTrackingConfidence:0.4});
 hands.onResults(r=>{handLm=r.multiHandLandmarks||[];});
 
-/* ------------ MediaPipe FaceMesh --------------------------- */
+/* ---------- MediaPipe FaceMesh -------------------------- */
 const face = new FaceMesh({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${f}`});
 face.setOptions({maxNumFaces:1,refineLandmarks:true,minDetectionConfidence:0.6,minTrackingConfidence:0.6});
 face.onResults(r=>{faceRes=r;});
 
-/* ------------ Cámara --------------------------------------- */
-navigator.mediaDevices.getUserMedia({
-  video:{facingMode:'user',width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30}}
-}).then(s=>{
-  video.srcObject=s;
-  video.addEventListener('canplay',()=>{video.play(); onFrame();});
-}).catch(e=>alert('Permiso de cámara denegado:\n'+e));
+/* ---------- Cámara & selector --------------------------- */
+let currentStream=null;
 
-/* ------------ Loop 2‑D (landmarks + gestos) ---------------- */
+async function startStream(deviceId){
+  /* detener flujo previo */
+  if(currentStream) currentStream.getTracks().forEach(t=>t.stop());
+
+  const constraints = deviceId
+        ? {video:{deviceId:{exact:deviceId}}}
+        : {video:{facingMode:'user'}};
+
+  currentStream = await navigator.mediaDevices.getUserMedia(constraints);
+  video.srcObject = currentStream;
+  await video.play();
+
+  /* rellenar selector de cámaras (después del permiso) */
+  const devices=await navigator.mediaDevices.enumerateDevices();
+  camSel.innerHTML='';
+  devices.filter(d=>d.kind==='videoinput').forEach(d=>{
+    const opt=document.createElement('option');
+    opt.value=d.deviceId; opt.textContent=d.label||`Cámara ${camSel.length+1}`;
+    if(d.deviceId===deviceId) opt.selected=true;
+    camSel.appendChild(opt);
+  });
+}
+
+/* cambio de cámara */
+camSel.addEventListener('change',e=>startStream(e.target.value));
+
+/* primer arranque */
+startStream(null).catch(e=>alert('Error cámara: '+e));
+
+/* ---------- Loop 2‑D (landmarks + gestos) --------------- */
 async function onFrame(){
   if(video.readyState>=2 && video.videoWidth){
     await hands.send({image:video});
@@ -118,29 +166,27 @@ async function onFrame(){
     const s=Math.min(cw/vw,ch/vh), dw=vw*s, dh=vh*s, dx=(cw-dw)/2, dy=(ch-dh)/2;
 
     ctx.clearRect(0,0,cw,ch);
-
-    /* ----- dibujar manos ----- */
     ctx.save(); ctx.translate(cw,0); ctx.scale(-1,1);
+
+    /* ---- manos ---- */
     handLm.forEach(lm=>{
       ctx.strokeStyle='#0F0'; ctx.lineWidth=4;
       HAND_CONNECTIONS.forEach(([i,j])=>{
         const p1=lm[i], p2=lm[j];
-        ctx.beginPath();
-        ctx.moveTo(dx+p1.x*dw,dy+p1.y*dh);
-        ctx.lineTo(dx+p2.x*dw,dy+p2.y*dh);
-        ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(dx+p1.x*dw,dy+p1.y*dh);
+        ctx.lineTo(dx+p2.x*dw,dy+p2.y*dh); ctx.stroke();
       });
       lm.forEach((p,i)=>{
         const x=dx+p.x*dw, y=dy+p.y*dh;
         let col='#FFF';
-        if(i<=4)col=colors.thumb; else if(i<=8)col=colors.index;
-        else if(i<=12)col=colors.middle; else if(i<=16)col=colors.ring;
+        if(i<=4)col=colors.thumb;else if(i<=8)col=colors.index;
+        else if(i<=12)col=colors.middle;else if(i<=16)col=colors.ring;
         else col=colors.pinky;
         ctx.beginPath(); ctx.arc(x,y,8,0,2*Math.PI); ctx.fillStyle=col; ctx.fill();
       });
     });
 
-    /* ----- dibujar cara ----- */
+    /* ---- cara ---- */
     if(faceRes?.multiFaceLandmarks?.length){
       const lm=faceRes.multiFaceLandmarks[0];
       let minX=1,minY=1,maxX=0,maxY=0;
@@ -151,16 +197,16 @@ async function onFrame(){
     }
     ctx.restore();
 
-    /* ----- gestos / física ----- */
+    /* ---- gestos / física ---- */
     const [hA,hB]=handLm;
 
-    /* 1) Agarre -------------------------------------------------- */
+    /* Agarre */
     if(hA && isPinch(hA) && !grabbed){
       const xN=2*hA[8].x-1, yN=-2*hA[8].y+1;
       ray.setFromCamera({x:xN,y:yN},camera);
       const hit=ray.intersectObject(boxMesh)[0];
       if(hit){
-        handProxy=new CANNON.Body({type:CANNON.Body.KINEMATIC, mass:0});
+        handProxy=new CANNON.Body({type:CANNON.Body.KINEMATIC, mass:0, material:bounceMat});
         handProxy.position.copy(hit.point);
         world.addBody(handProxy);
         grabJoint=new CANNON.LockConstraint(boxBody,handProxy);
@@ -170,20 +216,17 @@ async function onFrame(){
       }
     }
 
-    /* 2) Mover mientras agarrado -------------------------------- */
+    /* Mover mientras agarrado */
     if(grabbed && handProxy && hA){
       const xN=2*hA[8].x-1, yN=-2*hA[8].y+1;
       const vec=new THREE.Vector3(xN,yN,0.5).unproject(camera);
-      const worldPos=new CANNON.Vec3(vec.x,vec.y,vec.z);
-
-      /* velocidad = Δpos / dt */
-      const delta=worldPos.vsub(prevPos);
+      const wp=new CANNON.Vec3(vec.x,vec.y,vec.z);
+      const delta=wp.vsub(prevPos);
       handProxy.velocity.copy(delta.scale(1/lastDt));
-      handProxy.position.copy(worldPos);
-      prevPos.copy(worldPos);
+      handProxy.position.copy(wp);
+      prevPos.copy(wp);
 
-      /* Soltar */
-      if(!isPinch(hA)){
+      if(!isPinch(hA)){          // soltar
         boxBody.velocity.copy(handProxy.velocity);
         boxBody.angularVelocity.copy(handProxy.angularVelocity);
         world.removeConstraint(grabJoint); world.removeBody(handProxy);
@@ -191,7 +234,7 @@ async function onFrame(){
       }
     }
 
-    /* 3) Escala con dos manos ----------------------------------- */
+    /* Escala */
     if(hA&&hB){
       const d=Math.hypot(hA[0].x-hB[0].x,hA[0].y-hB[0].y);
       if(isPinch(hA)&&isPinch(hB)){
@@ -202,27 +245,29 @@ async function onFrame(){
         boxBody.shapes[0].halfExtents.set(half,half,half);
         boxBody.shapes[0].updateConvexPolyhedronRepresentation();
         boxBody.updateBoundingRadius();
-        boxBody.mass = 1 * Math.pow(f,3);     // masa ∝ volumen
+        boxBody.mass = 1*Math.pow(f,3);
+        boxBody.material=bounceMat;        // asegura mismo material
         boxBody.updateMassProperties();
       }else scaleInit=null;
     }
   }
   requestAnimationFrame(onFrame);
 }
+video.addEventListener('playing',onFrame);
 
-/* ------------ Loop 3‑D (física + render) ------------------- */
+/* ---------- Loop 3‑D (física + render) ------------------- */
 let lastT=performance.now();
 (function anim(){
   requestAnimationFrame(anim);
-  const now=performance.now(); const dt=(now-lastT)/1000; lastT=now;
+  const now=performance.now(), dt=(now-lastT)/1000; lastT=now;
   lastDt=dt;
-  world.step(1/60,dt,3);                 // sub‑stepping 3
+  world.step(1/60,dt,3);             // sub‑steps 3
   boxMesh.position.copy(boxBody.position);
   boxMesh.quaternion.copy(boxBody.quaternion);
   renderer.render(scene,camera);
 })();
 
-/* ------------ Responsive ----------------------------------- */
+/* ---------- Responsive ---------------------------------- */
 addEventListener('resize',()=>{
   camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth,innerHeight);
