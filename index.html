@@ -1,8 +1,8 @@
 <!DOCTYPE html>
 <html lang="es">
 <head>
-  <meta charset="UTF-8">
-  <title>Tracker + Físicas 3‑D</title>
+  <meta charset="utf-8">
+  <title>Tracker + Físicas 3‑D (robusto)</title>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <style>
     html,body{margin:0;padding:0;overflow:hidden;width:100%;height:100%;background:#000;}
@@ -11,6 +11,9 @@
     canvas#webgl_canvas{position:absolute;top:0;left:0;width:100%;height:100%;z-index:0;}
     canvas#output_canvas{position:absolute;top:0;left:0;width:100%;height:100%;
                          z-index:1;pointer-events:none;}
+    #alert{position:absolute;top:0;left:0;width:100%;height:100%;display:flex;
+           align-items:center;justify-content:center;color:#fff;font:700 1.2rem sans-serif;
+           background:rgba(200,0,0,.7);z-index:10;visibility:hidden;}
   </style>
 
   <!-- MediaPipe -->
@@ -19,59 +22,60 @@
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
 </head>
 <body>
-  <video id="input_video" playsinline muted></video> <!-- autoplay ya no hace falta -->
+  <div id="alert">⚠️ Permiso de cámara denegado.<br>Comprueba HTTPS y concede acceso.</div>
+  <video id="input_video" playsinline muted></video>
   <canvas id="output_canvas"></canvas>
 
   <script type="module">
-    /* ---------- Imports ---------- */
+    /***************  IMPORTS  ********************************************/
     import * as THREE  from 'https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js';
     import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js';
 
-    /* ---------- DOM ---------- */
+    /***************  DOM / GLOBALS  **************************************/
     const video  = document.getElementById('input_video');
     const canvas = document.getElementById('output_canvas');
     const ctx    = canvas.getContext('2d',{willReadFrequently:true});
+    const alertBox=document.getElementById('alert');
 
-    /* ---------- Three + Cannon (sin cambios) ---------- */
+    /***************  THREE + CANNON  *************************************/
     const scene  = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(60,innerWidth/innerHeight,0.1,100);
     camera.position.set(0,1.5,3);
 
-    const renderer = new THREE.WebGLRenderer({antialias:true,alpha:true});
+    const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
     renderer.setSize(innerWidth,innerHeight);
-    renderer.domElement.id = 'webgl_canvas';
+    renderer.domElement.id='webgl_canvas';
     document.body.insertBefore(renderer.domElement,canvas);
 
     scene.add(new THREE.HemisphereLight(0xffffff,0x444444,1.2));
 
-    const world = new CANNON.World({gravity:new CANNON.Vec3(0,-9.82,0)});
-    const ground = new CANNON.Body({mass:0,shape:new CANNON.Plane()});
+    const world=new CANNON.World({gravity:new CANNON.Vec3(0,-9.82,0)});
+    const ground=new CANNON.Body({mass:0,shape:new CANNON.Plane()});
     ground.quaternion.setFromEuler(-Math.PI/2,0,0); world.addBody(ground);
 
-    const baseSize=0.3;
-    const boxBody=new CANNON.Body({
-      mass:1,shape:new CANNON.Box(new CANNON.Vec3(baseSize,baseSize,baseSize))
-    });
+    const base=0.3;
+    const boxBody=new CANNON.Body({mass:1,shape:new CANNON.Box(new CANNON.Vec3(base,base,base))});
     boxBody.position.set(0,1,0); world.addBody(boxBody);
 
     const boxMesh=new THREE.Mesh(
-      new THREE.BoxGeometry(baseSize*2,baseSize*2,baseSize*2),
+      new THREE.BoxGeometry(base*2,base*2,base*2),
       new THREE.MeshStandardMaterial({color:0x2194ce})
     );
     scene.add(boxMesh);
 
-    /* ---------- Variables de gesto (sin cambios) ---------- */
+    /***************  GESTO / LANDMARK VARS  ******************************/
     let handLandmarks=[], faceResults=null;
     const fingerColors={thumb:'#F00',index:'#0F0',middle:'#00F',ring:'#FF0',pinky:'#F0F'};
     const raycaster=new THREE.Raycaster();
-    let grabbed=false,handProxy=null,grabJoint=null,scaleInit=null;
+    let grabbed=false, handProxy=null, grabJoint=null, scaleInit=null;
+
     const isPinching=h=>{
       if(!h) return false;
       const d=Math.hypot(h[4].x-h[8].x,h[4].y-h[8].y,h[4].z-h[8].z);
       return d<0.04;
     };
 
-    /* ---------- MediaPipe ---------- */
+    /***************  MEDIAPIPE  ******************************************/
     const hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
     hands.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:0.7,minTrackingConfidence:0.7});
     hands.onResults(r=>{handLandmarks=r.multiHandLandmarks||[];});
@@ -80,113 +84,125 @@
     faceMesh.setOptions({maxNumFaces:1,refineLandmarks:true,minDetectionConfidence:0.7,minTrackingConfidence:0.7});
     faceMesh.onResults(r=>{faceResults=r;});
 
-    /* ---------- Cámara ---------- */
-    navigator.mediaDevices.getUserMedia({video:true})
+    /***************  CÁMARA  *********************************************/
+    navigator.mediaDevices.getUserMedia({video:{facingMode:'user'}})
       .then(stream=>{
         video.srcObject=stream;
-        video.onloadedmetadata=()=>{                 // *** Nuevo punto de arranque ***
-          video.play().catch(console.warn);         // fuerza el autoplay
-          onFrame();                                // inicia el loop 2‑D
-        };
-      })
-      .catch(e=>alert('Permiso de cámara denegado o contexto no seguro:\n'+e));
-
-    /* ---------- Loop 2‑D (overlay) ---------- */
-    async function onFrame(){
-      if(video.readyState>=2){                      // HAVE_CURRENT_DATA
-        await Promise.all([hands.send({image:video}),faceMesh.send({image:video})]);
-
-        /* -- Dibujo -- */
-        const vw=video.videoWidth, vh=video.videoHeight;
-        const cw=canvas.width=innerWidth, ch=canvas.height=innerHeight;
-        const s=Math.min(cw/vw,ch/vh), dw=vw*s, dh=vh*s, dx=(cw-dw)/2, dy=(ch-dh)/2;
-
-        ctx.save(); ctx.translate(cw,0); ctx.scale(-1,1);
-        ctx.drawImage(video,0,0,vw,vh,dx,dy,dw,dh);
-
-        handLandmarks.forEach(lm=>{
-          ctx.strokeStyle='#0F0'; ctx.lineWidth=2;
-          HAND_CONNECTIONS.forEach(([i,j])=>{
-            const p1=lm[i],p2=lm[j];
-            ctx.beginPath();
-            ctx.moveTo(dx+p1.x*dw,dy+p1.y*dh);
-            ctx.lineTo(dx+p2.x*dw,dy+p2.y*dh);
-            ctx.stroke();
-          });
-          lm.forEach((p,i)=>{
-            const x=dx+p.x*dw, y=dy+p.y*dh;
-            let col='#FFF';
-            if(i<=4)col=fingerColors.thumb; else
-            if(i<=8)col=fingerColors.index; else
-            if(i<=12)col=fingerColors.middle; else
-            if(i<=16)col=fingerColors.ring; else
-            col=fingerColors.pinky;
-            ctx.beginPath(); ctx.arc(x,y,6,0,2*Math.PI); ctx.fillStyle=col; ctx.fill();
-          });
+        video.addEventListener('canplay',()=>{      /* ARRANQUE FIABLE   */
+          video.play().catch(console.warn);
+          alertBox.style.visibility='hidden';
+          onFrame();                                /* loop 2‑D          */
         });
+      })
+      .catch(err=>{
+        console.error(err);
+        alertBox.style.visibility='visible';
+      });
 
-        if(faceResults?.multiFaceLandmarks?.length){
-          const lm=faceResults.multiFaceLandmarks[0];
-          let minX=1,minY=1,maxX=0,maxY=0;
-          lm.forEach(p=>{minX=Math.min(minX,p.x);minY=Math.min(minY,p.y);
-                         maxX=Math.max(maxX,p.x);maxY=Math.max(maxY,p.y);});
-          ctx.strokeStyle='#0F0'; ctx.lineWidth=2;
-          ctx.strokeRect(dx+minX*dw,dy+minY*dh,(maxX-minX)*dw,(maxY-minY)*dh);
-        }
-        ctx.restore();
+    /***************  LOOP 2‑D (overlay)  *********************************/
+    async function onFrame(){
+      try{
+        if(video.readyState>=2&&video.videoWidth){
+          await Promise.all([hands.send({image:video}),faceMesh.send({image:video})]);
 
-        /* -- Gestos (sin cambios) -- */
-        const [hA,hB]=handLandmarks;
-        if(hA&&isPinching(hA)&&!grabbed){
-          const xN=2*hA[8].x-1,yN=-2*hA[8].y+1;
-          raycaster.setFromCamera({x:xN,y:yN},camera);
-          const hit=raycaster.intersectObject(boxMesh)[0];
-          if(hit){
-            handProxy=new CANNON.Body({mass:0});
-            handProxy.position.copy(boxBody.position); world.addBody(handProxy);
-            grabJoint=new CANNON.LockConstraint(boxBody,handProxy); world.addConstraint(grabJoint);
-            grabbed=true;
+          const vw=video.videoWidth,vh=video.videoHeight;
+          const cw=canvas.width=innerWidth,ch=canvas.height=innerHeight;
+          const s=Math.min(cw/vw,ch/vh),dw=vw*s,dh=vh*s,dx=(cw-dw)/2,dy=(ch-dh)/2;
+
+          ctx.clearRect(0,0,cw,ch);
+          ctx.save();
+          ctx.translate(cw,0);ctx.scale(-1,1);
+          ctx.drawImage(video,0,0,vw,vh,dx,dy,dw,dh);
+
+          /* --- MANOS --- */
+          handLandmarks.forEach(lm=>{
+            ctx.strokeStyle='#0F0';ctx.lineWidth=2;
+            HAND_CONNECTIONS.forEach(([i,j])=>{
+              const p1=lm[i],p2=lm[j];
+              ctx.beginPath();
+              ctx.moveTo(dx+p1.x*dw,dy+p1.y*dh);
+              ctx.lineTo(dx+p2.x*dw,dy+p2.y*dh);
+              ctx.stroke();
+            });
+            lm.forEach((p,i)=>{
+              const x=dx+p.x*dw,y=dy+p.y*dh;
+              let c='#FFF';
+              if(i<=4)c=fingerColors.thumb;else
+              if(i<=8)c=fingerColors.index;else
+              if(i<=12)c=fingerColors.middle;else
+              if(i<=16)c=fingerColors.ring;else c=fingerColors.pinky;
+              ctx.beginPath();ctx.arc(x,y,5,0,2*Math.PI);ctx.fillStyle=c;ctx.fill();
+            });
+          });
+
+          /* --- CARA --- */
+          if(faceResults?.multiFaceLandmarks?.length){
+            const lm=faceResults.multiFaceLandmarks[0];
+            let minX=1,minY=1,maxX=0,maxY=0;
+            lm.forEach(p=>{minX=Math.min(minX,p.x);minY=Math.min(minY,p.y);
+                           maxX=Math.max(maxX,p.x);maxY=Math.max(maxY,p.y);});
+            ctx.strokeStyle='#0F0';ctx.lineWidth=2;
+            ctx.strokeRect(dx+minX*dw,dy+minY*dh,(maxX-minX)*dw,(maxY-minY)*dh);
           }
-        }
-        if(grabbed&&handProxy&&hA){
-          const xN=2*hA[8].x-1,yN=-2*hA[8].y+1;
-          const v=new THREE.Vector3(xN,yN,0.5).unproject(camera);
-          handProxy.position.copy(v);
-          if(!isPinching(hA)){
-            world.removeConstraint(grabJoint); world.removeBody(handProxy);
-            grabbed=handProxy=grabJoint=null;
+          ctx.restore();
+
+          /* --- GESTOS SOBRE CUBO (sin cambios) --- */
+          const [hA,hB]=handLandmarks;
+          if(hA&&isPinching(hA)&&!grabbed){
+            const xN=2*hA[8].x-1,yN=-2*hA[8].y+1;
+            raycaster.setFromCamera({x:xN,y:yN},camera);
+            const hit=raycaster.intersectObject(boxMesh)[0];
+            if(hit){
+              handProxy=new CANNON.Body({mass:0});
+              handProxy.position.copy(boxBody.position);world.addBody(handProxy);
+              grabJoint=new CANNON.LockConstraint(boxBody,handProxy);world.addConstraint(grabJoint);
+              grabbed=true;
+            }
           }
+          if(grabbed&&handProxy&&hA){
+            const xN=2*hA[8].x-1,yN=-2*hA[8].y+1;
+            handProxy.position.copy(new THREE.Vector3(xN,yN,0.5).unproject(camera));
+            if(!isPinching(hA)){
+              world.removeConstraint(grabJoint);world.removeBody(handProxy);
+              grabbed=handProxy=grabJoint=null;
+            }
+          }
+          if(hA&&hB){
+            const d=Math.hypot(hA[0].x-hB[0].x,hA[0].y-hB[0].y);
+            if(isPinching(hA)&&isPinching(hB)){
+              if(scaleInit===null)scaleInit=d;
+              const f=d/scaleInit;
+              boxMesh.scale.setScalar(f);
+              const half=base*f;
+              boxBody.shapes[0].halfExtents.set(half,half,half);
+              boxBody.shapes[0].updateConvexPolyhedronRepresentation();
+              boxBody.updateBoundingRadius();
+            }else scaleInit=null;
+          }
+        }else if(!video.videoWidth){
+          /* flujo no disponible -> alerta visual */
+          alertBox.style.visibility='visible';
         }
-        if(hA&&hB){
-          const d=Math.hypot(hA[0].x-hB[0].x,hA[0].y-hB[0].y);
-          if(isPinching(hA)&&isPinching(hB)){
-            if(scaleInit===null) scaleInit=d;
-            const f=d/scaleInit;
-            boxMesh.scale.setScalar(f);
-            const half=baseSize*f;
-            boxBody.shapes[0].halfExtents.set(half,half,half);
-            boxBody.shapes[0].updateConvexPolyhedronRepresentation();
-            boxBody.updateBoundingRadius();
-          }else{scaleInit=null;}
-        }
+      }catch(e){
+        console.error('onFrame error',e);
       }
-      requestAnimationFrame(onFrame);               // sigue corriendo siempre
+      requestAnimationFrame(onFrame);
     }
 
-    /* ---------- Loop 3‑D ---------- */
+    /***************  LOOP 3‑D  *******************************************/
     let last=performance.now();
-    (function animate(){
-      requestAnimationFrame(animate);
-      const now=performance.now(),dt=(now-last)/1000; last=now;
+    (function anim(){
+      requestAnimationFrame(anim);
+      const now=performance.now(),dt=(now-last)/1000;last=now;
       world.step(1/60,dt,3);
       boxMesh.position.copy(boxBody.position);
       boxMesh.quaternion.copy(boxBody.quaternion);
       renderer.render(scene,camera);
     })();
 
-    /* ---------- Responsivo ---------- */
+    /***************  RESPONSIVE  *****************************************/
     addEventListener('resize',()=>{
-      camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
+      camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();
       renderer.setSize(innerWidth,innerHeight);
     });
   </script>
